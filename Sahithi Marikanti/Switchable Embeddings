@@ -1,0 +1,261 @@
+
+import os, sys, re, logging, json, requests, time
+import PyPDF2
+from dotenv import load_dotenv
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.core.tools import FunctionTool
+from llama_index.core.agent import ReActAgent
+from pydantic import BaseModel, Field
+from llama_index.core.node_parser import SentenceSplitter # Import for chunking control
+
+# --- Load environment variables ---
+load_dotenv()
+
+# --- Logging setup ---
+# Suppress most LlamaIndex and HTTP client logs by default for cleaner output
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Get a specific logger for your application
+logger.setLevel(logging.INFO) # Keep your application's INFO messages visible
+
+# Suppress specific noisy loggers
+logging.getLogger('llama_index').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+# --- Embedding Models ---
+EMBEDDINGS = {
+    1: {"name": "BAAI/bge-base-en-v1.5", "type": "huggingface"},
+    2: {"name": "BAAI/bge-large-en-v1.5", "type": "huggingface"},
+    3: {"name": "BAAI/bge-small-en-v1.5", "type": "huggingface"},
+    4: {"name": "intfloat/e5-base-v2", "type": "huggingface"},
+    5: {"name": "sentence-transformers/all-MiniLM-L6-v2", "type": "huggingface"},
+    6: {"name": "nomic-embed-text", "type": "ollama"}
+}
+
+# --- Utility Functions ---
+def display_models():
+    print("\n" + "="*60)
+    print("Available Embedding Models:")
+    print("="*60)
+    for k, v in EMBEDDINGS.items():
+        print(f"{k}. {v['name']} ({v['type']})")
+    print("="*60 + "\n")
+
+def get_model_choice():
+    while True:
+        try:
+            display_models()
+            c = input("Select an embedding model (1-6) or 'q' to quit: ").strip()
+            if c.lower() == 'q':
+                sys.exit("Exiting program.")
+            c = int(c)
+            if c in EMBEDDINGS:
+                return EMBEDDINGS[c]
+            else:
+                print("Invalid choice. Please select a number between 1-6.")
+        except ValueError:
+            print("Invalid input. Please enter a number between 1-6 or 'q' to quit.")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during model selection: {e}")
+            print("An error occurred. Please try again.")
+
+def create_embedding(model_info):
+    logger.info(f"Initializing embedding model: {model_info['name']}")
+    try:
+        if model_info['type'] == 'huggingface':
+            # trust_remote_code is often needed for HuggingFace models
+            return HuggingFaceEmbedding(model_name=model_info['name'], trust_remote_code=True)
+        elif model_info['type'] == 'ollama':
+            return OllamaEmbedding(model_name=model_info['name'])
+        else:
+            raise ValueError("Unsupported embedding type")
+    except Exception as e:
+        logger.critical(f"FATAL ERROR: Failed to initialize embedding model {model_info['name']}: {e}")
+        logger.critical("Please ensure the model is installed/pulled (for Ollama) or dependencies are met (for HuggingFace).")
+        sys.exit(1)
+
+def extract_text_from_pdf(pdf_path):
+    logger.info(f"Extracting text from PDF: {os.path.basename(pdf_path)}")
+    try:
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            # Filter out empty pages and join text
+            raw = '\n'.join(p.extract_text() for p in reader.pages if p.extract_text())
+            # Replace multiple whitespaces with single space
+            return re.sub(r'\s{2,}', ' ', raw).strip()
+    except PyPDF2.errors.PdfReadError:
+        logger.critical(f"FATAL ERROR: Could not read PDF file '{pdf_path}'. It might be encrypted or corrupted. Exiting.")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"FATAL ERROR: An unexpected error occurred during PDF extraction: {e}. Exiting.")
+        sys.exit(1)
+
+def save_text(text, output_path):
+    logger.info(f"Saving extracted text to: {output_path}")
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except Exception as e:
+        logger.critical(f"FATAL ERROR: Could not save text to '{output_path}': {e}. Exiting.")
+        sys.exit(1)
+
+class GoogleSearch:
+    def __init__(self):
+        self.key = os.getenv("GOOGLE_API_KEY")
+        self.cx = os.getenv("GOOGLE_CSE_ID")
+        if not self.key or not self.cx:
+            logger.critical("FATAL ERROR: Google API Key or CSE ID environment variables are missing. Cannot perform web searches.")
+            sys.exit(1)
+        logger.info("Google API Key and CSE ID validated.")
+
+    def search(self, query: str) -> str:
+        # Changed to logger.debug to suppress this during normal operation
+        logger.debug(f"Searching Google for: {query}")
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": self.key, "cx": self.cx, "q": query, "num": 3} # Limit results
+            )
+            r.raise_for_status() # Raise an exception for HTTP errors
+            data = r.json()
+            results = []
+            if "items" in data:
+                for item in data["items"]:
+                    results.append(f"Title: {item.get('title', 'N/A')}\nSnippet: {item.get('snippet', 'N/A')}\nLink: {item.get('link', 'N/A')}\n---")
+            return '\n'.join(results) if results else "No relevant search results found."
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error during Google Custom Search API call: {e}")
+            return f"Error performing web search: {str(e)}"
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON response from Google Search API: {e}")
+            return "Error processing web search results."
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during Google Search: {e}")
+            return "An unexpected error occurred during web search."
+
+# --- Main Pipeline ---
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python mcp_with_switchable_embeddings.py <PDF_PATH>")
+        sys.exit(1)
+
+    pdf_path = sys.argv[1]
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    os.makedirs("curated", exist_ok=True)
+    txt_path = os.path.join("curated", base_name + ".txt")
+
+    logger.info("Starting PDF processing and indexing setup...")
+    text = extract_text_from_pdf(pdf_path)
+    if not text:
+        logger.critical(f"FATAL ERROR: No text extracted from PDF '{pdf_path}'. Exiting.")
+        sys.exit(1)
+    save_text(text, txt_path)
+    docs = SimpleDirectoryReader(input_files=[txt_path]).load_data()
+    if not docs:
+        logger.critical(f"FATAL ERROR: No documents loaded from '{txt_path}'. Exiting.")
+        sys.exit(1)
+
+    model_info = get_model_choice()
+    embedding = create_embedding(model_info)
+    
+    # Set global LlamaIndex settings
+    Settings.embed_model = embedding
+    Settings.llm = Ollama(model="llama3", request_timeout=600)
+    
+    # Optional: Configure chunking strategy for better RAG
+    # Settings.text_splitter = SentenceSplitter(chunk_size=512, chunk_overlap=20)
+
+    logger.info(f"Creating VectorStoreIndex using {model_info['name']}...")
+    try:
+        index = VectorStoreIndex.from_documents(docs, show_progress=True)
+        local_engine = index.as_query_engine()
+        logger.info("Local PDF data indexed successfully.")
+    except Exception as e:
+        logger.critical(f"FATAL ERROR: Could not create VectorStoreIndex: {e}. Exiting.")
+        sys.exit(1)
+
+    try:
+        search_tool_instance = GoogleSearch()
+    except ValueError as e:
+        logger.critical(f"FATAL ERROR: {e}. Exiting.")
+        sys.exit(1)
+
+    # Define Pydantic model for local_book_qa input
+    class BookQueryInput(BaseModel):
+        query: str = Field(description="The question to ask about the PDF book content.")
+
+    # Define the local RAG tool function
+    def local_book_qa_func(query: str) -> str:
+        # Changed to logger.debug to suppress this during normal operation
+        logger.debug(f"Querying local book for: {query}")
+        try:
+            response = local_engine.query(query)
+            return str(response)
+        except Exception as e:
+            logger.error(f"Error during local RAG query: {e}")
+            return "An error occurred while querying the local document."
+
+    # Define tools with improved descriptions
+    local_tool = FunctionTool.from_defaults(
+        fn=local_book_qa_func,
+        name="local_book_qa",
+        description=(
+            "**ONLY use this tool for factual questions directly answerable by the specific content of this PDF book.** "
+            "This tool excels at retrieving details, definitions, and processes described within the loaded document. "
+            "DO NOT use this for subjective questions (e.g., 'best', 'worst'), external comparisons, general knowledge, "
+            "current events, or information not explicitly contained within the book. "
+            "If the question requires external context or comparisons, use 'google_web_search'."
+        ),
+        fn_schema=BookQueryInput, # Explicitly pass the Pydantic schema
+    )
+
+    google_tool = FunctionTool.from_defaults(
+        fn=search_tool_instance.search,
+        name="google_web_search",
+        description=(
+            "**ONLY use this tool for questions requiring up-to-date information, general knowledge, "
+            "external comparisons (e.g., 'best', 'popular', 'reviews'), or verifying facts not found within the PDF book.** "
+            "This tool accesses the internet for broader information. "
+            "DO NOT use this tool for questions that are clearly about the specific, factual content of the provided PDF book; "
+            "use 'local_book_qa' for those."
+        ),
+    )
+
+    # Initialize the ReAct Agent
+    logger.info("Initializing ReAct Agent...")
+    agent = ReActAgent.from_tools(
+        tools=[local_tool, google_tool],
+        llm=Settings.llm,
+        verbose=False, # Set to False for cleaner output
+        max_iterations=20 # Increased iterations for more robustness
+    )
+
+    logger.info("\n--- Hybrid Chatbot Ready ---")
+    logger.info(f"Using LLM: {Settings.llm.model}")
+    logger.info(f"Using Embedding Model: {model_info['name']}")
+    logger.info("Type your questions (type 'exit' to quit).")
+
+    # Interactive Query Loop
+    while True:
+        q = input("\nYour Question: ").strip()
+        if q.lower() == 'exit':
+            logger.info("Exiting Hybrid Chatbot. Goodbye!")
+            break
+        
+        print("\n" + "="*50)
+        print("--- Agent's Response ---")
+        print("="*50)
+        try:
+            res = agent.chat(q)
+            print(res.response)
+        except Exception as e:
+            logger.error(f"An error occurred during agent interaction: {e}")
+            print("An error occurred while processing your request. Please try again or rephrase your question.")
+        print("="*50 + "\n")
+
+if __name__ == "__main__":
+    main()
